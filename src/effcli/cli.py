@@ -527,9 +527,44 @@ def _print_report_output(data, title_prefix, date_range_str, is_week, is_month):
                 prio = f" [{task.priority.value}]" if task.priority != Priority.MEDIUM else ""
                 console.print(f"- [{task.due_date}] [{task.project}] {task.title}{prio}")
         
+        if data['project_rank']:
+            console.print()
+            console.print("## 🏆 项目投入排行")
+            total_focus = data['total_focus_seconds']
+            for i, (proj, dur) in enumerate(data['project_rank'], 1):
+                pct = int(dur / total_focus * 100) if total_focus > 0 else 0
+                console.print(f"{i}. **{proj}**: {format_duration(dur)} ({pct}%)")
+        
+        if data['daily_summary']:
+            console.print()
+            console.print("## 📅 每日投入小结")
+            for d in data['all_dates']:
+                info = data['daily_summary'].get(d, {'total': 0, 'top_project': None, 'all_projects': {}})
+                if info['total'] > 0:
+                    date_short = d[5:]
+                    total_str = format_duration(info['total'])
+                    if info['top_project']:
+                        top_pct = int(info['top_project_duration'] / info['total'] * 100)
+                        projects_str = ", ".join([
+                            f"{proj}({int(dur / info['total'] * 100)}%)"
+                            for proj, dur in sorted(info['all_projects'].items(), key=lambda x: x[1], reverse=True)
+                        ])
+                        console.print(f"- **{date_short}**: {total_str}, 主要: {projects_str}")
+        
+        if data['by_task_focus']:
+            console.print()
+            console.print("## 📋 任务专注明细")
+            sorted_tasks = sorted(
+                data['by_task_focus'].items(),
+                key=lambda x: x[1]['duration'],
+                reverse=True
+            )
+            for task_id, info in sorted_tasks:
+                console.print(f"- [{info['project']}] {info['title']}: {format_duration(info['duration'])}")
+        
         if data['project_summary']:
             console.print()
-            console.print("## 📊 按项目投入")
+            console.print("## 📊 按项目汇总")
             for project, info in sorted(data['project_summary'].items()):
                 console.print(f"### {project}")
                 console.print(f"- 完成任务: {info['count']} 个")
@@ -709,6 +744,84 @@ def _print_terminal_review(data, title_prefix, date_range_str, is_week, is_month
                     f"{status_icon} {status_text}"
                 )
             console.print(completed_table)
+            console.print()
+        
+        if data['daily_summary']:
+            console.print("[bold]📅 每日投入分布[/]")
+            daily_dist_table = Table(box=box.SIMPLE, show_lines=False)
+            daily_dist_table.add_column("日期", style="dim", no_wrap=True)
+            daily_dist_table.add_column("总时长", justify="right", no_wrap=True)
+            daily_dist_table.add_column("主要投入项目")
+            daily_dist_table.add_column("项目分布")
+            
+            for d in data['all_dates']:
+                info = data['daily_summary'].get(d, {'total': 0, 'top_project': None, 'all_projects': {}})
+                total_str = format_duration(info['total']) if info['total'] > 0 else "-"
+                
+                if info['total'] > 0 and info['top_project']:
+                    top_pct = int(info['top_project_duration'] / info['total'] * 100)
+                    main_project = f"{info['top_project']} ({top_pct}%)"
+                    
+                    project_parts = []
+                    for proj, dur in sorted(info['all_projects'].items(), key=lambda x: x[1], reverse=True):
+                        pct = int(dur / info['total'] * 100)
+                        bar_len = int(pct / 5)
+                        bar = "█" * bar_len
+                        project_parts.append(f"{proj} {bar} {pct}%")
+                    project_dist = "\n".join(project_parts)
+                else:
+                    main_project = "-"
+                    project_dist = "-"
+                
+                date_short = d[5:]
+                daily_dist_table.add_row(date_short, total_str, main_project, project_dist)
+            
+            console.print(daily_dist_table)
+            console.print()
+        
+        if data['project_rank']:
+            console.print("[bold]🏆 项目投入排行[/]")
+            rank_table = Table(box=box.SIMPLE, show_lines=False)
+            rank_table.add_column("排名", justify="right", no_wrap=True)
+            rank_table.add_column("项目")
+            rank_table.add_column("专注时长", justify="right", no_wrap=True)
+            rank_table.add_column("占比", justify="right", no_wrap=True)
+            rank_table.add_column("分布", no_wrap=True)
+            
+            total_focus = data['total_focus_seconds']
+            for i, (proj, dur) in enumerate(data['project_rank'], 1):
+                pct = int(dur / total_focus * 100) if total_focus > 0 else 0
+                bar_len = int(pct / 5)
+                bar = "█" * bar_len
+                rank_table.add_row(
+                    str(i),
+                    proj,
+                    format_duration(dur),
+                    f"{pct}%",
+                    f"[cyan]{bar}[/]"
+                )
+            console.print(rank_table)
+            console.print()
+        
+        if data['by_task_focus']:
+            console.print("[bold]📋 按任务汇总专注[/]")
+            task_focus_table = Table(box=box.SIMPLE, show_lines=False)
+            task_focus_table.add_column("项目", style="dim")
+            task_focus_table.add_column("任务")
+            task_focus_table.add_column("专注时长", justify="right")
+            
+            sorted_tasks = sorted(
+                data['by_task_focus'].items(),
+                key=lambda x: x[1]['duration'],
+                reverse=True
+            )
+            for task_id, info in sorted_tasks:
+                task_focus_table.add_row(
+                    info['project'],
+                    info['title'],
+                    format_duration(info['duration'])
+                )
+            console.print(task_focus_table)
             console.print()
         
         if data['project_summary']:
@@ -928,7 +1041,7 @@ def search(keyword, project, status, date_from, date_to, date_field):
         click.echo(f"错误: {e.message}", err=True)
         return
     
-    results = db.search_tasks_advanced(
+    search_result = db.search_tasks_advanced(
         keyword=keyword,
         project=project,
         status=status,
@@ -936,6 +1049,9 @@ def search(keyword, project, status, date_from, date_to, date_field):
         date_to=parsed_to,
         date_field=date_field,
     )
+    
+    results = search_result['tasks']
+    matched_projects = search_result['matched_projects']
     
     if not results:
         conditions = []
@@ -955,7 +1071,10 @@ def search(keyword, project, status, date_from, date_to, date_field):
     if keyword:
         filters_desc.append(f"'{keyword}'")
     if project:
-        filters_desc.append(f"项目:{project}")
+        if matched_projects:
+            filters_desc.append(f"匹配项目:[{', '.join(matched_projects)}]")
+        else:
+            filters_desc.append(f"项目:{project} (无匹配)")
     if status:
         filters_desc.append(f"状态:{status}")
     if parsed_from or parsed_to:
@@ -968,6 +1087,8 @@ def search(keyword, project, status, date_from, date_to, date_field):
         filters_desc.append(f"{date_field_label}:{parsed_from or '...'}~{parsed_to or '...'}")
     
     console.print(f"[bold]找到 {len(results)} 个任务[/] ({', '.join(filters_desc)})")
+    if matched_projects:
+        console.print(f"[dim]已匹配项目: {', '.join(matched_projects)}[/]")
     if results[0]['date_field'] and (parsed_from or parsed_to):
         date_field_name = results[0]['date_field']
         date_field_label = {
@@ -1060,13 +1181,17 @@ def show(task_id):
     ))
 
 
-@cli.command()
+@cli.group(invoke_without_command=True)
 @click.option("-t", "--task", "task_id", type=int, help="按任务ID筛选")
 @click.option("--from", "date_from", help="开始日期，支持：今天、昨天、上周一、2026-06-01 等")
 @click.option("--to", "date_to", help="结束日期，支持：今天、昨天、上周一、2026-06-01 等")
 @click.option("-d", "--date", "date", help="指定日期，支持：今天、昨天、上周一、2026-06-01 等，等同于 --from 和 --to 同一天")
-def sessions(task_id, date_from, date_to, date):
-    """查看专注记录历史"""
+@click.pass_context
+def sessions(ctx, task_id, date_from, date_to, date):
+    """专注记录管理：查看、补录、修改、删除"""
+    if ctx.invoked_subcommand is not None:
+        return
+    
     try:
         if date:
             parsed_date = parse_date(date)
@@ -1102,6 +1227,7 @@ def sessions(task_id, date_from, date_to, date):
     console.print()
     
     table = Table(box=box.SIMPLE, show_lines=False)
+    table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("日期", style="dim", no_wrap=True)
     table.add_column("时间", style="dim", no_wrap=True)
     table.add_column("任务")
@@ -1135,6 +1261,7 @@ def sessions(task_id, date_from, date_to, date):
             reason = "-"
         
         table.add_row(
+            str(session['id']),
             date_str,
             time_range,
             session['title'],
@@ -1145,6 +1272,215 @@ def sessions(task_id, date_from, date_to, date):
         )
     
     console.print(table)
+
+
+@sessions.command("add")
+@click.option("-t", "--task", "task_id", type=int, required=True, help="任务ID")
+@click.option("--start", "start_time", required=True, help="开始时间，格式：2026-06-09 10:00:00 或 10:00")
+@click.option("--end", "end_time", required=True, help="结束时间，格式：2026-06-09 11:00:00 或 11:00")
+@click.option("-r", "--reason", "interrupt_reason", help="中断原因（如果有）")
+def sessions_add(task_id, start_time, end_time, interrupt_reason):
+    """补录专注记录"""
+    def parse_datetime(input_str, base_date=None):
+        if base_date is None:
+            base_date = date.today()
+        
+        if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$', input_str):
+            if len(input_str) == 16:
+                input_str += ":00"
+            return datetime.strptime(input_str, "%Y-%m-%d %H:%M:%S")
+        elif re.match(r'^\d{2}:\d{2}(:\d{2})?$', input_str):
+            if len(input_str) == 5:
+                input_str += ":00"
+            time_part = datetime.strptime(input_str, "%H:%M:%S").time()
+            return datetime.combine(base_date, time_part)
+        else:
+            raise ValueError(f"无法识别的时间格式: {input_str}")
+    
+    try:
+        start_dt = parse_datetime(start_time)
+        end_dt = parse_datetime(end_time, start_dt.date())
+        
+        if end_dt <= start_dt:
+            end_dt += timedelta(days=1)
+        
+        start_str = start_dt.isoformat()
+        end_str = end_dt.isoformat()
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        return
+    
+    task = db.get_task(task_id)
+    if not task:
+        click.echo(f"错误: 找不到任务 ID {task_id}", err=True)
+        return
+    
+    duration = int((end_dt - start_dt).total_seconds())
+    
+    console.print(Panel(
+        f"[bold]即将补录以下专注记录：[/bold]\n\n"
+        f"任务: [{task.priority.value}] {task.title}\n"
+        f"项目: {task.project}\n"
+        f"开始: {start_str}\n"
+        f"结束: {end_str}\n"
+        f"时长: {format_duration(duration)}\n"
+        f"中断原因: {interrupt_reason or '无'}",
+        title="⚠️  请确认",
+        border_style="yellow"
+    ))
+    
+    if not click.confirm("确认补录？"):
+        console.print("[dim]已取消[/]")
+        return
+    
+    try:
+        session_id = db.add_focus_session(task_id, start_str, end_str, interrupt_reason)
+        console.print(Panel(
+            f"[bold]补录成功！[/bold]\n\n"
+            f"记录ID: {session_id}\n"
+            f"任务总专注时间已自动更新",
+            title="✓ 已补录",
+            border_style="green"
+        ))
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+
+
+@sessions.command("edit")
+@click.argument("session_id", type=int)
+@click.option("-t", "--task", "task_id", type=int, help="修改关联的任务ID")
+@click.option("--start", "start_time", help="修改开始时间")
+@click.option("--end", "end_time", help="修改结束时间")
+@click.option("-r", "--reason", "interrupt_reason", help="修改中断原因，输入 'none' 清除")
+def sessions_edit(session_id, task_id, start_time, end_time, interrupt_reason):
+    """修改专注记录"""
+    session = db.get_focus_session(session_id)
+    if not session:
+        click.echo(f"错误: 找不到专注记录 ID {session_id}", err=True)
+        return
+    
+    if not any([task_id, start_time, end_time, interrupt_reason]):
+        click.echo("错误: 请至少指定一个要修改的属性", err=True)
+        return
+    
+    def parse_datetime(input_str, base_date=None):
+        if base_date is None:
+            base_date = date.today()
+        
+        if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$', input_str):
+            if len(input_str) == 16:
+                input_str += ":00"
+            return datetime.strptime(input_str, "%Y-%m-%d %H:%M:%S")
+        elif re.match(r'^\d{2}:\d{2}(:\d{2})?$', input_str):
+            if len(input_str) == 5:
+                input_str += ":00"
+            time_part = datetime.strptime(input_str, "%H:%M:%S").time()
+            return datetime.combine(base_date, time_part)
+        else:
+            raise ValueError(f"无法识别的时间格式: {input_str}")
+    
+    updates = []
+    new_start = None
+    new_end = None
+    
+    try:
+        if start_time:
+            new_start_dt = parse_datetime(start_time)
+            new_start = new_start_dt.isoformat()
+            updates.append(f"开始: {session['start_time']} → {new_start}")
+        
+        if end_time:
+            base_for_end = date.fromisoformat(new_start[:10]) if new_start else date.fromisoformat(session['start_time'][:10])
+            new_end_dt = parse_datetime(end_time, base_for_end)
+            if new_start and new_end_dt <= parse_datetime(new_start):
+                new_end_dt += timedelta(days=1)
+            new_end = new_end_dt.isoformat()
+            updates.append(f"结束: {session['end_time']} → {new_end}")
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        return
+    
+    if task_id:
+        new_task = db.get_task(task_id)
+        if not new_task:
+            click.echo(f"错误: 找不到任务 ID {task_id}", err=True)
+            return
+        updates.append(f"任务: #{session['task_id']} {session['title']} → #{task_id} {new_task.title}")
+    
+    if interrupt_reason:
+        if interrupt_reason.lower() == 'none':
+            new_reason = None
+            updates.append(f"中断原因: {session['interrupt_reason'] or '无'} → 无")
+        else:
+            new_reason = interrupt_reason
+            updates.append(f"中断原因: {session['interrupt_reason'] or '无'} → {new_reason}")
+    else:
+        new_reason = None
+    
+    console.print(Panel(
+        f"[bold]即将修改记录 #{session_id}：[/bold]\n\n" + "\n".join(updates) + "\n\n任务总专注时间将自动重新计算",
+        title="⚠️  请确认",
+        border_style="yellow"
+    ))
+    
+    if not click.confirm("确认修改？"):
+        console.print("[dim]已取消[/]")
+        return
+    
+    try:
+        db.update_focus_session(
+            session_id=session_id,
+            start_time=new_start,
+            end_time=new_end,
+            interrupt_reason=new_reason,
+            task_id=task_id
+        )
+        console.print(Panel(
+            f"[bold]修改成功！[/bold]\n\n"
+            f"相关任务的总专注时间已自动更新",
+            title="✓ 已修改",
+            border_style="green"
+        ))
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+
+
+@sessions.command("delete")
+@click.argument("session_id", type=int)
+def sessions_delete(session_id):
+    """删除专注记录"""
+    session = db.get_focus_session(session_id)
+    if not session:
+        click.echo(f"错误: 找不到专注记录 ID {session_id}", err=True)
+        return
+    
+    console.print(Panel(
+        f"[bold]即将删除以下专注记录：[/bold]\n\n"
+        f"ID: {session_id}\n"
+        f"任务: {session['title']}\n"
+        f"项目: {session['project']}\n"
+        f"开始: {session['start_time']}\n"
+        f"结束: {session['end_time']}\n"
+        f"时长: {format_duration(session['duration'])}\n\n"
+        f"[yellow]删除后任务 #{session['task_id']} 的总专注时间将自动重新计算[/]",
+        title="⚠️  请确认",
+        border_style="red"
+    ))
+    
+    if not click.confirm("确认删除？此操作不可撤销"):
+        console.print("[dim]已取消[/]")
+        return
+    
+    try:
+        db.delete_focus_session(session_id)
+        console.print(Panel(
+            f"[bold]删除成功！[/bold]\n\n"
+            f"任务 #{session['task_id']} 的总专注时间已自动更新",
+            title="✓ 已删除",
+            border_style="green"
+        ))
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
 
 
 @cli.command()
@@ -1273,9 +1609,14 @@ def stats(project, priority, date_from, date_to, output_json):
         console.print(json.dumps(json_data, ensure_ascii=False, indent=2))
         return
     
+    matched_projects = data.get('matched_projects', [])
+    
     filters = []
     if project:
-        filters.append(f"项目: {project}")
+        if matched_projects:
+            filters.append(f"匹配项目: [{', '.join(matched_projects)}]")
+        else:
+            filters.append(f"项目: {project} (无匹配)")
     if priority:
         filters.append(f"优先级: {priority}")
     if parsed_from or parsed_to:
@@ -1285,6 +1626,10 @@ def stats(project, priority, date_from, date_to, output_json):
         f"[bold]📊 效率统计[/bold]" + (f"  [dim]({', '.join(filters)})[/]" if filters else ""),
         border_style="blue"
     ))
+    
+    if matched_projects:
+        console.print(f"[dim]已匹配项目: {', '.join(matched_projects)}[/]")
+        console.print()
     console.print()
     
     summary = data['summary']

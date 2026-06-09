@@ -220,6 +220,115 @@ class Database:
                 
                 conn.commit()
     
+    def _recalculate_task_focus_time(self, conn, task_id: int) -> None:
+        result = conn.execute("""
+            SELECT COALESCE(SUM(duration), 0) as total
+            FROM focus_sessions
+            WHERE task_id = ? AND end_time IS NOT NULL
+        """, (task_id,)).fetchone()
+        total = result['total'] if result else 0
+        conn.execute("""
+            UPDATE tasks SET total_focus_time = ? WHERE id = ?
+        """, (total, task_id))
+    
+    def get_focus_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT fs.*, t.title, t.project
+                FROM focus_sessions fs
+                JOIN tasks t ON fs.task_id = t.id
+                WHERE fs.id = ?
+            """, (session_id,)).fetchone()
+            return dict(row) if row else None
+    
+    def add_focus_session(
+        self,
+        task_id: int,
+        start_time: str,
+        end_time: str,
+        interrupt_reason: Optional[str] = None,
+    ) -> int:
+        task = self.get_task(task_id)
+        if not task:
+            raise ValueError(f"任务 {task_id} 不存在")
+        
+        start_dt = datetime.fromisoformat(start_time)
+        end_dt = datetime.fromisoformat(end_time)
+        
+        if end_dt <= start_dt:
+            raise ValueError("结束时间必须晚于开始时间")
+        
+        duration = int((end_dt - start_dt).total_seconds())
+        interrupted = 1 if interrupt_reason else 0
+        
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                INSERT INTO focus_sessions (task_id, start_time, end_time, duration, interrupted, interrupt_reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (task_id, start_time, end_time, duration, interrupted, interrupt_reason))
+            
+            self._recalculate_task_focus_time(conn, task_id)
+            conn.commit()
+            return cursor.lastrowid
+    
+    def update_focus_session(
+        self,
+        session_id: int,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        interrupt_reason: Optional[str] = None,
+        task_id: Optional[int] = None,
+    ) -> bool:
+        session = self.get_focus_session(session_id)
+        if not session:
+            raise ValueError(f"专注记录 {session_id} 不存在")
+        
+        new_task_id = task_id if task_id is not None else session['task_id']
+        new_start = start_time if start_time else session['start_time']
+        new_end = end_time if end_time else session['end_time']
+        
+        if new_task_id != session['task_id']:
+            task = self.get_task(new_task_id)
+            if not task:
+                raise ValueError(f"任务 {new_task_id} 不存在")
+        
+        start_dt = datetime.fromisoformat(new_start)
+        if new_end:
+            end_dt = datetime.fromisoformat(new_end)
+            if end_dt <= start_dt:
+                raise ValueError("结束时间必须晚于开始时间")
+            duration = int((end_dt - start_dt).total_seconds())
+        else:
+            duration = 0
+        
+        interrupted = 1 if interrupt_reason else (session['interrupted'] if interrupt_reason is None else 0)
+        new_interrupt_reason = interrupt_reason if interrupt_reason is not None else session['interrupt_reason']
+        
+        with self._connect() as conn:
+            conn.execute("""
+                UPDATE focus_sessions
+                SET task_id=?, start_time=?, end_time=?, duration=?, interrupted=?, interrupt_reason=?
+                WHERE id=?
+            """, (new_task_id, new_start, new_end, duration, interrupted, new_interrupt_reason, session_id))
+            
+            self._recalculate_task_focus_time(conn, session['task_id'])
+            if new_task_id != session['task_id']:
+                self._recalculate_task_focus_time(conn, new_task_id)
+            
+            conn.commit()
+            return True
+    
+    def delete_focus_session(self, session_id: int) -> bool:
+        session = self.get_focus_session(session_id)
+        if not session:
+            raise ValueError(f"专注记录 {session_id} 不存在")
+        
+        with self._connect() as conn:
+            conn.execute("DELETE FROM focus_sessions WHERE id = ?", (session_id,))
+            self._recalculate_task_focus_time(conn, session['task_id'])
+            conn.commit()
+            return True
+    
     def get_tasks_by_status(self, status: TaskStatus) -> List[Task]:
         with self._connect() as conn:
             rows = conn.execute("""
@@ -244,6 +353,34 @@ class Database:
                 ORDER BY project
             """).fetchall()
             return [row['project'] for row in rows]
+    
+    def parse_project_filter(self, project_filter: Optional[str]) -> Tuple[Optional[List[str]], List[str]]:
+        if not project_filter:
+            return None, []
+        
+        all_projects = self.get_all_projects()
+        matched_projects = []
+        
+        for part in project_filter.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            
+            exact_match = False
+            for p in all_projects:
+                if p == part:
+                    if p not in matched_projects:
+                        matched_projects.append(p)
+                    exact_match = True
+                    break
+            
+            if not exact_match:
+                for p in all_projects:
+                    if part.lower() in p.lower():
+                        if p not in matched_projects:
+                            matched_projects.append(p)
+        
+        return matched_projects if matched_projects else None, matched_projects
     
     def archive_completed_tasks(self) -> int:
         with self._connect() as conn:
@@ -383,17 +520,21 @@ class Database:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         date_field: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         base_query = "SELECT * FROM tasks WHERE 1=1"
         params = []
+        
+        matched_projects = []
+        if project:
+            project_list, matched_projects = self.parse_project_filter(project)
+            if project_list:
+                placeholders = ','.join('?' * len(project_list))
+                base_query += f" AND project IN ({placeholders})"
+                params.extend(project_list)
         
         if keyword:
             base_query += " AND (title LIKE ? OR summary LIKE ? OR interrupt_reasons LIKE ?)"
             params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
-        
-        if project:
-            base_query += " AND project = ?"
-            params.append(project)
         
         status_condition = ""
         if status:
@@ -437,7 +578,10 @@ class Database:
                     'task': task,
                     'date_field': determined_date_field,
                 })
-            return results
+            return {
+                'tasks': results,
+                'matched_projects': matched_projects,
+            }
     
     def get_focus_sessions(
         self,
@@ -559,12 +703,18 @@ class Database:
             """, (date_from, date_from, date_from)).fetchall()
             
             overdue_end = conn.execute("""
-                SELECT * FROM tasks 
-                WHERE status NOT IN ('done', 'archived')
-                AND due_date IS NOT NULL 
-                AND DATE(due_date) <= ?
-                ORDER BY due_date
-            """, (date_to,)).fetchall()
+                SELECT t.* FROM tasks t
+                WHERE t.due_date IS NOT NULL 
+                AND DATE(t.due_date) <= ?
+                AND (
+                    t.status NOT IN ('done', 'archived')
+                    OR (
+                        t.status IN ('done', 'archived')
+                        AND DATE(t.completed_at) > ?
+                    )
+                )
+                ORDER BY t.due_date
+            """, (date_to, date_to)).fetchall()
             
             due_soon = conn.execute("""
                 SELECT * FROM tasks 
@@ -624,6 +774,68 @@ class Database:
                 if s['interrupted'] and s['interrupt_reason']:
                     interrupt_reasons.append(s['interrupt_reason'])
             
+            daily_project_focus = {}
+            daily_task_focus = {}
+            by_task_focus = {}
+            for s in sessions:
+                if s['end_time']:
+                    day = datetime.fromisoformat(s['start_time']).date().isoformat()
+                    proj = s['project']
+                    task_id = s['task_id']
+                    task_title = s['title']
+                    dur = s['duration']
+                    
+                    if day not in daily_project_focus:
+                        daily_project_focus[day] = {}
+                    if proj not in daily_project_focus[day]:
+                        daily_project_focus[day][proj] = 0
+                    daily_project_focus[day][proj] += dur
+                    
+                    if day not in daily_task_focus:
+                        daily_task_focus[day] = {}
+                    task_key = f"{task_id}|{task_title}"
+                    if task_key not in daily_task_focus[day]:
+                        daily_task_focus[day][task_key] = {'duration': 0, 'project': proj, 'title': task_title}
+                    daily_task_focus[day][task_key]['duration'] += dur
+                    
+                    if task_id not in by_task_focus:
+                        by_task_focus[task_id] = {'duration': 0, 'project': proj, 'title': task_title}
+                    by_task_focus[task_id]['duration'] += dur
+            
+            date_from_obj = date.fromisoformat(date_from)
+            date_to_obj = date.fromisoformat(date_to)
+            all_dates = []
+            current = date_from_obj
+            while current <= date_to_obj:
+                all_dates.append(current.isoformat())
+                current += timedelta(days=1)
+            
+            project_rank = sorted(
+                [(proj, dur) for proj, dur in project_focus_from_sessions.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )
+            
+            daily_summary = {}
+            for d in all_dates:
+                day_projects = daily_project_focus.get(d, {})
+                total_day = sum(day_projects.values())
+                if total_day > 0:
+                    top_project = max(day_projects.items(), key=lambda x: x[1])
+                    daily_summary[d] = {
+                        'total': total_day,
+                        'top_project': top_project[0],
+                        'top_project_duration': top_project[1],
+                        'all_projects': day_projects,
+                    }
+                else:
+                    daily_summary[d] = {
+                        'total': 0,
+                        'top_project': None,
+                        'top_project_duration': 0,
+                        'all_projects': {},
+                    }
+            
             return {
                 'period_type': period_type,
                 'date_from': date_from,
@@ -637,6 +849,12 @@ class Database:
                 'high_priority_completed': [self._row_to_task(r) for r in high_priority_completed],
                 'project_summary': project_summary,
                 'by_project_focus': project_focus_from_sessions,
+                'by_task_focus': by_task_focus,
+                'daily_project_focus': daily_project_focus,
+                'daily_task_focus': daily_task_focus,
+                'daily_summary': daily_summary,
+                'project_rank': project_rank,
+                'all_dates': all_dates,
                 'daily_completed': daily_completed,
                 'interrupt_reasons': interrupt_reasons,
                 'total_focus_seconds': total_focus,
@@ -654,9 +872,13 @@ class Database:
         query = "SELECT * FROM tasks WHERE 1=1"
         params = []
         
+        matched_projects = []
         if project:
-            query += " AND project = ?"
-            params.append(project)
+            project_list, matched_projects = self.parse_project_filter(project)
+            if project_list:
+                placeholders = ','.join('?' * len(project_list))
+                query += f" AND project IN ({placeholders})"
+                params.extend(project_list)
         
         if priority:
             query += " AND priority = ?"
@@ -725,6 +947,7 @@ class Database:
                     'date_from': date_from,
                     'date_to': date_to,
                 },
+                'matched_projects': matched_projects,
                 'summary': {
                     'total_tasks': total_tasks,
                     'completed_tasks': completed_count,
