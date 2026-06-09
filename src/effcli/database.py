@@ -271,7 +271,7 @@ class Database:
             review_date = date.today().isoformat()
         
         next_day = (datetime.fromisoformat(review_date) + timedelta(days=1)).date().isoformat()
-        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        tomorrow = next_day
         
         with self._connect() as conn:
             completed = conn.execute("""
@@ -382,40 +382,62 @@ class Database:
         status: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
-    ) -> List[Task]:
-        query = "SELECT * FROM tasks WHERE 1=1"
+        date_field: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        base_query = "SELECT * FROM tasks WHERE 1=1"
         params = []
         
         if keyword:
-            query += " AND (title LIKE ? OR summary LIKE ? OR interrupt_reasons LIKE ?)"
+            base_query += " AND (title LIKE ? OR summary LIKE ? OR interrupt_reasons LIKE ?)"
             params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
         
         if project:
-            query += " AND project = ?"
+            base_query += " AND project = ?"
             params.append(project)
         
+        status_condition = ""
         if status:
             if status == "all":
                 pass
             elif status == "active":
-                query += " AND status IN ('todo', 'in_progress', 'paused')"
+                status_condition = " AND status IN ('todo', 'in_progress', 'paused')"
             else:
-                query += " AND status = ?"
+                status_condition = " AND status = ?"
                 params.append(status)
         
-        if date_from:
-            query += " AND DATE(created_at) >= ?"
-            params.append(date_from)
+        base_query += status_condition
         
-        if date_to:
-            query += " AND DATE(created_at) <= ?"
-            params.append(date_to)
+        determined_date_field = date_field
+        if not determined_date_field and (date_from or date_to):
+            if status in ['done', 'archived']:
+                determined_date_field = 'completed_at'
+            elif status in ['todo', 'in_progress', 'paused', 'active']:
+                determined_date_field = 'due_date'
+            else:
+                determined_date_field = 'created_at'
         
-        query += " ORDER BY created_at DESC"
+        date_condition = ""
+        if date_from or date_to:
+            field = determined_date_field
+            if date_from:
+                date_condition += f" AND DATE({field}) >= ?"
+                params.append(date_from)
+            if date_to:
+                date_condition += f" AND DATE({field}) <= ?"
+                params.append(date_to)
+        
+        query = base_query + date_condition + " ORDER BY created_at DESC"
         
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-            return [self._row_to_task(row) for row in rows]
+            results = []
+            for row in rows:
+                task = self._row_to_task(row)
+                results.append({
+                    'task': task,
+                    'date_field': determined_date_field,
+                })
+            return results
     
     def get_focus_sessions(
         self,
@@ -472,3 +494,296 @@ class Database:
                     created_at DESC
             """).fetchall()
             return [self._row_to_task(row) for row in rows]
+    
+    def get_week_range(self, base_date: Optional[str] = None) -> tuple:
+        if base_date is None:
+            base = date.today()
+        else:
+            base = datetime.fromisoformat(base_date).date()
+        
+        start = base - timedelta(days=base.weekday())
+        end = start + timedelta(days=6)
+        return start.isoformat(), end.isoformat()
+    
+    def get_month_range(self, base_date: Optional[str] = None) -> tuple:
+        if base_date is None:
+            base = date.today()
+        else:
+            base = datetime.fromisoformat(base_date).date()
+        
+        start = base.replace(day=1)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end = start.replace(month=start.month + 1, day=1) - timedelta(days=1)
+        return start.isoformat(), end.isoformat()
+    
+    def get_period_review_data(self, date_from: str, date_to: str, period_type: str = "custom") -> Dict[str, Any]:
+        with self._connect() as conn:
+            completed = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE (status = 'done' OR status = 'archived') 
+                AND DATE(completed_at) >= ? AND DATE(completed_at) <= ?
+                ORDER BY completed_at
+            """, (date_from, date_to)).fetchall()
+            
+            added = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE DATE(created_at) >= ? AND DATE(created_at) <= ?
+                ORDER BY created_at
+            """, (date_from, date_to)).fetchall()
+            
+            sessions = conn.execute("""
+                SELECT fs.*, t.title, t.project 
+                FROM focus_sessions fs
+                JOIN tasks t ON fs.task_id = t.id
+                WHERE DATE(fs.start_time) >= ? AND DATE(fs.start_time) <= ?
+                ORDER BY fs.start_time
+            """, (date_from, date_to)).fetchall()
+            
+            overdue_start = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE status NOT IN ('done', 'archived')
+                AND due_date IS NOT NULL 
+                AND DATE(due_date) < ?
+            """, (date_from,)).fetchall()
+            
+            overdue_end = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE status NOT IN ('done', 'archived')
+                AND due_date IS NOT NULL 
+                AND DATE(due_date) < ?
+            """, (date_to,)).fetchall()
+            
+            due_soon = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE status NOT IN ('done', 'archived')
+                AND due_date IS NOT NULL 
+                AND DATE(due_date) > ? AND DATE(due_date) <= ?
+                ORDER BY due_date
+            """, (date_to, (datetime.fromisoformat(date_to) + timedelta(days=7)).date().isoformat())).fetchall()
+            
+            high_priority_completed = [r for r in completed if r['priority'] == 'high']
+            
+            total_focus = sum(s['duration'] for s in sessions if s['end_time'])
+            
+            project_summary = {}
+            for row in completed:
+                task = self._row_to_task(row)
+                if task.project not in project_summary:
+                    project_summary[task.project] = {
+                        'count': 0,
+                        'total_focus': 0,
+                        'high_priority_count': 0,
+                        'tasks': []
+                    }
+                project_summary[task.project]['count'] += 1
+                project_summary[task.project]['total_focus'] += task.total_focus_time
+                if task.priority == Priority.HIGH:
+                    project_summary[task.project]['high_priority_count'] += 1
+                project_summary[task.project]['tasks'].append(task)
+            
+            daily_completed = {}
+            for row in completed:
+                task = self._row_to_task(row)
+                day = datetime.fromisoformat(task.completed_at).date().isoformat()
+                if day not in daily_completed:
+                    daily_completed[day] = 0
+                daily_completed[day] += 1
+            
+            interrupt_reasons = []
+            for s in sessions:
+                if s['interrupted'] and s['interrupt_reason']:
+                    interrupt_reasons.append(s['interrupt_reason'])
+            
+            return {
+                'period_type': period_type,
+                'date_from': date_from,
+                'date_to': date_to,
+                'completed': [self._row_to_task(r) for r in completed],
+                'added': [self._row_to_task(r) for r in added],
+                'sessions': sessions,
+                'overdue_start': [self._row_to_task(r) for r in overdue_start],
+                'overdue_end': [self._row_to_task(r) for r in overdue_end],
+                'due_soon': [self._row_to_task(r) for r in due_soon],
+                'high_priority_completed': [self._row_to_task(r) for r in high_priority_completed],
+                'project_summary': project_summary,
+                'daily_completed': daily_completed,
+                'interrupt_reasons': interrupt_reasons,
+                'total_focus_seconds': total_focus,
+                'session_count': len(sessions),
+                'interruption_count': sum(1 for s in sessions if s['interrupted']),
+            }
+    
+    def get_stats_data(
+        self,
+        project: Optional[str] = None,
+        priority: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        
+        if priority:
+            query += " AND priority = ?"
+            params.append(priority)
+        
+        if date_from:
+            query += " AND DATE(created_at) >= ?"
+            params.append(date_from)
+        
+        if date_to:
+            query += " AND DATE(created_at) <= ?"
+            params.append(date_to)
+        
+        with self._connect() as conn:
+            tasks = conn.execute(query, params).fetchall()
+            
+            total_tasks = len(tasks)
+            completed_tasks = [t for t in tasks if t['status'] in ('done', 'archived')]
+            completed_count = len(completed_tasks)
+            
+            total_focus = sum(t['total_focus_time'] for t in completed_tasks)
+            avg_focus = total_focus / completed_count if completed_count > 0 else 0
+            
+            completion_rate = (completed_count / total_tasks * 100) if total_tasks > 0 else 0
+            
+            total_interrupts = sum(t['interrupt_count'] for t in completed_tasks)
+            avg_interrupts = total_interrupts / completed_count if completed_count > 0 else 0
+            
+            all_interrupt_reasons = []
+            for t in completed_tasks:
+                if t['interrupt_reasons']:
+                    reasons = t['interrupt_reasons'].split('; ')
+                    all_interrupt_reasons.extend(reasons)
+            
+            reason_counts = {}
+            for r in all_interrupt_reasons:
+                r = r.strip()
+                if r:
+                    reason_counts[r] = reason_counts.get(r, 0) + 1
+            
+            top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            
+            by_project = {}
+            for t in tasks:
+                p = t['project']
+                if p not in by_project:
+                    by_project[p] = {'total': 0, 'completed': 0, 'focus': 0}
+                by_project[p]['total'] += 1
+                if t['status'] in ('done', 'archived'):
+                    by_project[p]['completed'] += 1
+                    by_project[p]['focus'] += t['total_focus_time']
+            
+            by_priority = {}
+            for t in tasks:
+                p = t['priority']
+                if p not in by_priority:
+                    by_priority[p] = {'total': 0, 'completed': 0}
+                by_priority[p]['total'] += 1
+                if t['status'] in ('done', 'archived'):
+                    by_priority[p]['completed'] += 1
+            
+            return {
+                'filters': {
+                    'project': project,
+                    'priority': priority,
+                    'date_from': date_from,
+                    'date_to': date_to,
+                },
+                'summary': {
+                    'total_tasks': total_tasks,
+                    'completed_tasks': completed_count,
+                    'incomplete_tasks': total_tasks - completed_count,
+                    'completion_rate': round(completion_rate, 1),
+                    'total_focus_seconds': total_focus,
+                    'avg_focus_seconds': round(avg_focus),
+                    'total_interruptions': total_interrupts,
+                    'avg_interruptions': round(avg_interrupts, 1),
+                },
+                'top_interrupt_reasons': top_reasons,
+                'by_project': by_project,
+                'by_priority': by_priority,
+            }
+    
+    def batch_update_tasks(
+        self,
+        filter_project: Optional[str] = None,
+        filter_status: Optional[str] = None,
+        update_project: Optional[str] = None,
+        update_priority: Optional[str] = None,
+        update_due_date_shift: Optional[int] = None,
+    ) -> List[Task]:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        
+        if filter_project:
+            query += " AND project = ?"
+            params.append(filter_project)
+        
+        if filter_status:
+            if filter_status == "active":
+                query += " AND status IN ('todo', 'in_progress', 'paused')"
+            else:
+                query += " AND status = ?"
+                params.append(filter_status)
+        
+        query += " ORDER BY project, created_at"
+        
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            tasks = [self._row_to_task(r) for r in rows]
+            
+            updated_tasks = []
+            for task in tasks:
+                changed = False
+                
+                if update_project:
+                    task.project = update_project
+                    changed = True
+                
+                if update_priority:
+                    task.priority = Priority(update_priority)
+                    changed = True
+                
+                if update_due_date_shift is not None and task.due_date:
+                    current_due = datetime.fromisoformat(task.due_date)
+                    new_due = current_due + timedelta(days=update_due_date_shift)
+                    task.due_date = new_due.date().isoformat()
+                    changed = True
+                
+                if changed:
+                    self.update_task(task)
+                    updated_tasks.append(task)
+            
+            return updated_tasks
+    
+    def get_tasks_for_batch(
+        self,
+        filter_project: Optional[str] = None,
+        filter_status: Optional[str] = None,
+    ) -> List[Task]:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        
+        if filter_project:
+            query += " AND project = ?"
+            params.append(filter_project)
+        
+        if filter_status:
+            if filter_status == "active":
+                query += " AND status IN ('todo', 'in_progress', 'paused')"
+            else:
+                query += " AND status = ?"
+                params.append(filter_status)
+        
+        query += " ORDER BY project, created_at"
+        
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_task(r) for r in rows]
