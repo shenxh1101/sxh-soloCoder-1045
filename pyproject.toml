@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "effcli"
+version = "0.1.0"
+description = "个人效率命令行工具 - 快速管理任务、专注计时、每日回顾"
+requires-python = ">=3.8"
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+eff = "effcli.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
