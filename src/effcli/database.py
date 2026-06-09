@@ -1,6 +1,6 @@
 import sqlite3
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -270,10 +270,14 @@ class Database:
         if review_date is None:
             review_date = date.today().isoformat()
         
+        next_day = (datetime.fromisoformat(review_date) + timedelta(days=1)).date().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        
         with self._connect() as conn:
             completed = conn.execute("""
                 SELECT * FROM tasks 
-                WHERE status = 'done' AND DATE(completed_at) = ?
+                WHERE (status = 'done' OR status = 'archived') 
+                AND DATE(completed_at) = ?
                 ORDER BY project, completed_at
             """, (review_date,)).fetchall()
             
@@ -298,7 +302,36 @@ class Database:
                 ORDER BY fs.start_time
             """, (review_date,)).fetchall()
             
+            overdue = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE status NOT IN ('done', 'archived')
+                AND due_date IS NOT NULL 
+                AND DATE(due_date) < ?
+                ORDER BY due_date
+            """, (review_date,)).fetchall()
+            
+            due_tomorrow = conn.execute("""
+                SELECT * FROM tasks 
+                WHERE status NOT IN ('done', 'archived')
+                AND due_date IS NOT NULL 
+                AND DATE(due_date) = ?
+                ORDER BY project, priority
+            """, (tomorrow,)).fetchall()
+            
             total_focus = sum(s['duration'] for s in sessions if s['end_time'])
+            
+            project_summary = {}
+            for row in completed:
+                task = self._row_to_task(row)
+                if task.project not in project_summary:
+                    project_summary[task.project] = {
+                        'count': 0,
+                        'total_focus': 0,
+                        'tasks': []
+                    }
+                project_summary[task.project]['count'] += 1
+                project_summary[task.project]['total_focus'] += task.total_focus_time
+                project_summary[task.project]['tasks'].append(task)
             
             return {
                 'date': review_date,
@@ -306,6 +339,9 @@ class Database:
                 'started': [self._row_to_task(r) for r in started],
                 'added': [self._row_to_task(r) for r in added],
                 'sessions': sessions,
+                'overdue': [self._row_to_task(r) for r in overdue],
+                'due_tomorrow': [self._row_to_task(r) for r in due_tomorrow],
+                'project_summary': project_summary,
                 'total_focus_seconds': total_focus,
                 'session_count': len(sessions),
                 'interruption_count': sum(1 for s in sessions if s['interrupted']),
@@ -338,3 +374,101 @@ class Database:
             interrupted=bool(row['interrupted']),
             interrupt_reason=row['interrupt_reason'],
         )
+    
+    def search_tasks_advanced(
+        self, 
+        keyword: Optional[str] = None,
+        project: Optional[str] = None,
+        status: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> List[Task]:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        
+        if keyword:
+            query += " AND (title LIKE ? OR summary LIKE ? OR interrupt_reasons LIKE ?)"
+            params.extend([f'%{keyword}%', f'%{keyword}%', f'%{keyword}%'])
+        
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        
+        if status:
+            if status == "all":
+                pass
+            elif status == "active":
+                query += " AND status IN ('todo', 'in_progress', 'paused')"
+            else:
+                query += " AND status = ?"
+                params.append(status)
+        
+        if date_from:
+            query += " AND DATE(created_at) >= ?"
+            params.append(date_from)
+        
+        if date_to:
+            query += " AND DATE(created_at) <= ?"
+            params.append(date_to)
+        
+        query += " ORDER BY created_at DESC"
+        
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_task(row) for row in rows]
+    
+    def get_focus_sessions(
+        self,
+        task_id: Optional[int] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = """
+            SELECT fs.*, t.title, t.project 
+            FROM focus_sessions fs
+            JOIN tasks t ON fs.task_id = t.id
+            WHERE 1=1
+        """
+        params = []
+        
+        if task_id:
+            query += " AND fs.task_id = ?"
+            params.append(task_id)
+        
+        if date_from:
+            query += " AND DATE(fs.start_time) >= ?"
+            params.append(date_from)
+        
+        if date_to:
+            query += " AND DATE(fs.start_time) <= ?"
+            params.append(date_to)
+        
+        query += " ORDER BY fs.start_time DESC"
+        
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+    
+    def delete_task(self, task_id: int) -> bool:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM focus_sessions WHERE task_id = ?", (task_id,))
+            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def get_all_tasks(self) -> List[Task]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM tasks 
+                ORDER BY 
+                    CASE status 
+                        WHEN 'todo' THEN 1 
+                        WHEN 'in_progress' THEN 2 
+                        WHEN 'paused' THEN 3
+                        WHEN 'done' THEN 4
+                        ELSE 5 
+                    END,
+                    CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                    created_at DESC
+            """).fetchall()
+            return [self._row_to_task(row) for row in rows]
