@@ -2,8 +2,9 @@ import click
 import sys
 import os
 import json
+import re
 from datetime import datetime, date, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -19,6 +20,147 @@ if sys.platform == "win32":
 
 console = Console()
 db = Database()
+
+
+class DateParseError(Exception):
+    def __init__(self, date_str: str, message: str):
+        self.date_str = date_str
+        self.message = message
+        super().__init__(f"无法识别日期 '{date_str}': {message}")
+
+
+def parse_date(date_str: Optional[str], base_date: Optional[date] = None) -> Optional[str]:
+    if date_str is None:
+        return None
+    
+    if base_date is None:
+        base_date = date.today()
+    
+    original_date_str = date_str
+    date_str = date_str.strip().lower()
+    
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+            return date_str
+        except ValueError:
+            raise DateParseError(original_date_str, "日期格式不正确，请使用 YYYY-MM-DD 格式")
+    
+    weekday_map = {
+        '一': 0, '1': 0,
+        '二': 1, '2': 1,
+        '三': 2, '3': 2,
+        '四': 3, '4': 3,
+        '五': 4, '5': 4,
+        '六': 5, '6': 5,
+        '日': 6, '天': 6, '7': 6,
+    }
+    
+    if date_str in ['今天', '今日', 'today', 'jin tian']:
+        return base_date.isoformat()
+    
+    if date_str in ['昨天', '昨日', 'yesterday', 'zuo tian']:
+        return (base_date - timedelta(days=1)).isoformat()
+    
+    if date_str in ['明天', '明日', 'tomorrow', 'ming tian']:
+        return (base_date + timedelta(days=1)).isoformat()
+    
+    if date_str in ['前天', 'qian tian']:
+        return (base_date - timedelta(days=2)).isoformat()
+    
+    if date_str in ['后天', 'hou tian']:
+        return (base_date + timedelta(days=2)).isoformat()
+    
+    match = re.match(r'^(上|本|这)(周|星期)([一二三四五六日天1-7])?$', date_str)
+    if match:
+        prefix = match.group(1)
+        day_str = match.group(3)
+        
+        if prefix == '上':
+            week_offset = -1
+        else:
+            week_offset = 0
+        
+        if day_str is None:
+            if prefix == '上':
+                start_of_week = base_date - timedelta(days=base_date.weekday() + 7)
+                return start_of_week.isoformat()
+            else:
+                start_of_week = base_date - timedelta(days=base_date.weekday())
+                return start_of_week.isoformat()
+        
+        if day_str in weekday_map:
+            target_weekday = weekday_map[day_str]
+            current_weekday = base_date.weekday()
+            
+            if prefix == '上':
+                days_diff = target_weekday - current_weekday - 7
+            else:
+                days_diff = target_weekday - current_weekday
+            
+            target_date = base_date + timedelta(days=days_diff)
+            return target_date.isoformat()
+    
+    match = re.match(r'^(上|本|这)?(月|月份)?(初|底|末|1号|一号|最后一天)$', date_str)
+    if match:
+        prefix = match.group(1)
+        part = match.group(3)
+        
+        if prefix == '上':
+            if base_date.month == 1:
+                target_month = base_date.replace(year=base_date.year - 1, month=12, day=1)
+            else:
+                target_month = base_date.replace(month=base_date.month - 1, day=1)
+        else:
+            target_month = base_date.replace(day=1)
+        
+        if part in ['初', '1号', '一号']:
+            return target_month.isoformat()
+        elif part in ['底', '末', '最后一天']:
+            if target_month.month == 12:
+                last_day = target_month.replace(year=target_month.year + 1, month=1, day=1) - timedelta(days=1)
+            else:
+                last_day = target_month.replace(month=target_month.month + 1, day=1) - timedelta(days=1)
+            return last_day.isoformat()
+    
+    match = re.match(r'^(\d+)天(前|后|以前|以后)$', date_str)
+    if match:
+        days = int(match.group(1))
+        direction = match.group(2)
+        if direction in ['前', '以前']:
+            return (base_date - timedelta(days=days)).isoformat()
+        else:
+            return (base_date + timedelta(days=days)).isoformat()
+    
+    match = re.match(r'^(\d+)周(前|后|以前|以后)$', date_str)
+    if match:
+        weeks = int(match.group(1))
+        direction = match.group(2)
+        if direction in ['前', '以前']:
+            return (base_date - timedelta(weeks=weeks)).isoformat()
+        else:
+            return (base_date + timedelta(weeks=weeks)).isoformat()
+    
+    suggestions = [
+        "今天、昨天、明天",
+        "上周一、上周日、本周三",
+        "本月初、月底、上月末",
+        "3天前、2周后",
+        "2026-06-01",
+    ]
+    raise DateParseError(original_date_str, f"不认识的日期说法。试试：{', '.join(suggestions)}")
+
+
+def parse_date_range(date_from: Optional[str], date_to: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    base_date = date.today()
+    
+    parsed_from = parse_date(date_from, base_date) if date_from else None
+    parsed_to = parse_date(date_to, base_date) if date_to else None
+    
+    if parsed_from and parsed_to and parsed_from > parsed_to:
+        raise DateParseError(f"{date_from} ~ {date_to}", "开始日期不能晚于结束日期")
+    
+    return parsed_from, parsed_to
 
 
 def format_duration(seconds: int) -> str:
@@ -298,7 +440,7 @@ def done(task_id, summary):
 
 
 @cli.command()
-@click.option("-d", "--date", "review_date", help="回顾日期 (YYYY-MM-DD)，默认今天")
+@click.option("-d", "--date", "review_date", help="回顾日期，支持：今天、昨天、上周一、2026-06-01 等")
 @click.option("--week", is_flag=True, help="生成周报（自然周）")
 @click.option("--month", is_flag=True, help="生成月报（自然月）")
 @click.option("--report", is_flag=True, help="输出适合粘贴到日报/周报/月报的摘要")
@@ -308,7 +450,11 @@ def review(review_date, week, month, report):
         click.echo("错误: --week 和 --month 不能同时使用", err=True)
         return
     
-    base_date = review_date if review_date else date.today().isoformat()
+    try:
+        base_date = parse_date(review_date) if review_date else date.today().isoformat()
+    except DateParseError as e:
+        click.echo(f"错误: {e.message}", err=True)
+        return
     
     if week:
         date_from, date_to = db.get_week_range(base_date)
@@ -766,8 +912,8 @@ def archive():
 @click.argument("keyword", required=False)
 @click.option("-p", "--project", help="按项目筛选")
 @click.option("-s", "--status", type=click.Choice(["all", "active", "todo", "in_progress", "paused", "done", "archived"]), help="按状态筛选")
-@click.option("--from", "date_from", help="开始日期 (YYYY-MM-DD)")
-@click.option("--to", "date_to", help="结束日期 (YYYY-MM-DD)")
+@click.option("--from", "date_from", help="开始日期，支持：今天、昨天、上周一、2026-06-01 等")
+@click.option("--to", "date_to", help="结束日期，支持：今天、昨天、上周一、2026-06-01 等")
 @click.option("--date-field", type=click.Choice(["created_at", "completed_at", "due_date"]), 
               help="指定日期筛选字段，默认根据状态自动选择")
 def search(keyword, project, status, date_from, date_to, date_field):
@@ -776,12 +922,18 @@ def search(keyword, project, status, date_from, date_to, date_field):
         click.echo("错误: 请至少指定一个搜索条件（关键词、项目、状态或日期范围）", err=True)
         return
     
+    try:
+        parsed_from, parsed_to = parse_date_range(date_from, date_to)
+    except DateParseError as e:
+        click.echo(f"错误: {e.message}", err=True)
+        return
+    
     results = db.search_tasks_advanced(
         keyword=keyword,
         project=project,
         status=status,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=parsed_from,
+        date_to=parsed_to,
         date_field=date_field,
     )
     
@@ -793,8 +945,8 @@ def search(keyword, project, status, date_from, date_to, date_field):
             conditions.append(f"项目='{project}'")
         if status:
             conditions.append(f"状态='{status}'")
-        if date_from or date_to:
-            date_range = f"{date_from or '...'} - {date_to or '...'}"
+        if parsed_from or parsed_to:
+            date_range = f"{parsed_from or '...'} - {parsed_to or '...'}"
             conditions.append(f"日期={date_range}")
         console.print(f"[dim]未找到符合条件的任务: {', '.join(conditions)}[/]")
         return
@@ -806,17 +958,17 @@ def search(keyword, project, status, date_from, date_to, date_field):
         filters_desc.append(f"项目:{project}")
     if status:
         filters_desc.append(f"状态:{status}")
-    if date_from or date_to:
+    if parsed_from or parsed_to:
         date_field_name = results[0]['date_field'] if results[0]['date_field'] else 'created_at'
         date_field_label = {
             'created_at': '创建日期',
             'completed_at': '完成日期',
             'due_date': '截止日期',
         }.get(date_field_name, date_field_name)
-        filters_desc.append(f"{date_field_label}:{date_from or '...'}~{date_to or '...'}")
+        filters_desc.append(f"{date_field_label}:{parsed_from or '...'}~{parsed_to or '...'}")
     
     console.print(f"[bold]找到 {len(results)} 个任务[/] ({', '.join(filters_desc)})")
-    if results[0]['date_field'] and (date_from or date_to):
+    if results[0]['date_field'] and (parsed_from or parsed_to):
         date_field_name = results[0]['date_field']
         date_field_label = {
             'created_at': '创建日期',
@@ -910,19 +1062,25 @@ def show(task_id):
 
 @cli.command()
 @click.option("-t", "--task", "task_id", type=int, help="按任务ID筛选")
-@click.option("--from", "date_from", help="开始日期 (YYYY-MM-DD)")
-@click.option("--to", "date_to", help="结束日期 (YYYY-MM-DD)")
-@click.option("-d", "--date", "date", help="指定日期 (YYYY-MM-DD)，等同于 --from 和 --to 同一天")
+@click.option("--from", "date_from", help="开始日期，支持：今天、昨天、上周一、2026-06-01 等")
+@click.option("--to", "date_to", help="结束日期，支持：今天、昨天、上周一、2026-06-01 等")
+@click.option("-d", "--date", "date", help="指定日期，支持：今天、昨天、上周一、2026-06-01 等，等同于 --from 和 --to 同一天")
 def sessions(task_id, date_from, date_to, date):
     """查看专注记录历史"""
-    if date:
-        date_from = date
-        date_to = date
+    try:
+        if date:
+            parsed_date = parse_date(date)
+            parsed_from, parsed_to = parsed_date, parsed_date
+        else:
+            parsed_from, parsed_to = parse_date_range(date_from, date_to)
+    except DateParseError as e:
+        click.echo(f"错误: {e.message}", err=True)
+        return
     
     sessions_data = db.get_focus_sessions(
         task_id=task_id,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=parsed_from,
+        date_to=parsed_to,
     )
     
     if not sessions_data:
@@ -935,8 +1093,8 @@ def sessions(task_id, date_from, date_to, date):
     filters = []
     if task_id:
         filters.append(f"任务 #{task_id}")
-    if date_from or date_to:
-        filters.append(f"日期: {date_from or '...'} ~ {date_to or '...'}")
+    if parsed_from or parsed_to:
+        filters.append(f"日期: {parsed_from or '...'} ~ {parsed_to or '...'}")
     
     console.print(f"[bold]📊 专注记录[/] ({len(sessions_data)} 条记录, 总时长: {format_duration(total_duration)}, 中断: {total_interrupted} 次)")
     if filters:
@@ -1092,16 +1250,22 @@ def delete(task_id, yes):
 @cli.command()
 @click.option("-p", "--project", help="按项目筛选")
 @click.option("-P", "--priority", type=click.Choice(["high", "medium", "low"]), help="按优先级筛选")
-@click.option("--from", "date_from", help="开始日期 (YYYY-MM-DD)")
-@click.option("--to", "date_to", help="结束日期 (YYYY-MM-DD)")
+@click.option("--from", "date_from", help="开始日期，支持：今天、昨天、上周一、2026-06-01 等")
+@click.option("--to", "date_to", help="结束日期，支持：今天、昨天、上周一、2026-06-01 等")
 @click.option("--json", "output_json", is_flag=True, help="以 JSON 格式导出统计数据")
 def stats(project, priority, date_from, date_to, output_json):
     """统计分析：完成率、平均专注时长、常见中断原因等"""
+    try:
+        parsed_from, parsed_to = parse_date_range(date_from, date_to)
+    except DateParseError as e:
+        click.echo(f"错误: {e.message}", err=True)
+        return
+    
     data = db.get_stats_data(
         project=project,
         priority=priority,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=parsed_from,
+        date_to=parsed_to,
     )
     
     if output_json:
@@ -1114,8 +1278,8 @@ def stats(project, priority, date_from, date_to, output_json):
         filters.append(f"项目: {project}")
     if priority:
         filters.append(f"优先级: {priority}")
-    if date_from or date_to:
-        filters.append(f"日期: {date_from or '...'} ~ {date_to or '...'}")
+    if parsed_from or parsed_to:
+        filters.append(f"日期: {parsed_from or '...'} ~ {parsed_to or '...'}")
     
     console.print(Panel(
         f"[bold]📊 效率统计[/bold]" + (f"  [dim]({', '.join(filters)})[/]" if filters else ""),

@@ -542,17 +542,28 @@ class Database:
             """, (date_from, date_to)).fetchall()
             
             overdue_start = conn.execute("""
-                SELECT * FROM tasks 
-                WHERE status NOT IN ('done', 'archived')
-                AND due_date IS NOT NULL 
-                AND DATE(due_date) < ?
-            """, (date_from,)).fetchall()
+                SELECT t.* FROM tasks t
+                WHERE t.due_date IS NOT NULL 
+                AND DATE(t.due_date) < ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks t2 
+                    WHERE t2.id = t.id 
+                    AND t2.status IN ('done', 'archived')
+                    AND DATE(t2.completed_at) < ?
+                )
+                AND (
+                    t.status NOT IN ('done', 'archived')
+                    OR (t.status IN ('done', 'archived') AND DATE(t.completed_at) >= ?)
+                )
+                ORDER BY t.due_date
+            """, (date_from, date_from, date_from)).fetchall()
             
             overdue_end = conn.execute("""
                 SELECT * FROM tasks 
                 WHERE status NOT IN ('done', 'archived')
                 AND due_date IS NOT NULL 
-                AND DATE(due_date) < ?
+                AND DATE(due_date) <= ?
+                ORDER BY due_date
             """, (date_to,)).fetchall()
             
             due_soon = conn.execute("""
@@ -567,6 +578,14 @@ class Database:
             
             total_focus = sum(s['duration'] for s in sessions if s['end_time'])
             
+            project_focus_from_sessions = {}
+            for s in sessions:
+                if s['end_time']:
+                    proj = s['project']
+                    if proj not in project_focus_from_sessions:
+                        project_focus_from_sessions[proj] = 0
+                    project_focus_from_sessions[proj] += s['duration']
+            
             project_summary = {}
             for row in completed:
                 task = self._row_to_task(row)
@@ -578,10 +597,19 @@ class Database:
                         'tasks': []
                     }
                 project_summary[task.project]['count'] += 1
-                project_summary[task.project]['total_focus'] += task.total_focus_time
+                project_summary[task.project]['total_focus'] = project_focus_from_sessions.get(task.project, 0)
                 if task.priority == Priority.HIGH:
                     project_summary[task.project]['high_priority_count'] += 1
                 project_summary[task.project]['tasks'].append(task)
+            
+            for proj, focus_time in project_focus_from_sessions.items():
+                if proj not in project_summary:
+                    project_summary[proj] = {
+                        'count': 0,
+                        'total_focus': focus_time,
+                        'high_priority_count': 0,
+                        'tasks': []
+                    }
             
             daily_completed = {}
             for row in completed:
@@ -608,6 +636,7 @@ class Database:
                 'due_soon': [self._row_to_task(r) for r in due_soon],
                 'high_priority_completed': [self._row_to_task(r) for r in high_priority_completed],
                 'project_summary': project_summary,
+                'by_project_focus': project_focus_from_sessions,
                 'daily_completed': daily_completed,
                 'interrupt_reasons': interrupt_reasons,
                 'total_focus_seconds': total_focus,
@@ -726,7 +755,7 @@ class Database:
             query += " AND project = ?"
             params.append(filter_project)
         
-        if filter_status:
+        if filter_status and filter_status != "all":
             if filter_status == "active":
                 query += " AND status IN ('todo', 'in_progress', 'paused')"
             else:
@@ -775,7 +804,7 @@ class Database:
             query += " AND project = ?"
             params.append(filter_project)
         
-        if filter_status:
+        if filter_status and filter_status != "all":
             if filter_status == "active":
                 query += " AND status IN ('todo', 'in_progress', 'paused')"
             else:
